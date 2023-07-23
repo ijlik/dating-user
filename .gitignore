@@ -2,5 +2,5 @@ lint.xml
 .env
 
 .idea/
-storage/*
+storage/
 main
