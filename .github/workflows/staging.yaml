@@ -1,0 +1,167 @@
+name: staging-deploy
+
+on:
+  push:
+    branches:
+      - 'release_.**'
+
+env:
+  GCP_ARTIFACT_REGISTRY_ROOT: asia-southeast2-docker.pkg.dev
+  GCP_ARTIFACT_REGISTRY_PROJECT_ID: paireds-devops 
+  PRODUCT: viona
+  BINARY: users
+  DB_DNS_SUFFIX: viona.cloudsql
+  ENVIRONMENT: stg
+  DB_PASSWORD: ${{ secrets.STG_DB_PASSWORD }}
+  BRANCHING: ${{ github.head_ref || github.ref_name }}
+
+jobs:
+  migration_fix:
+    runs-on:
+      - self-hosted
+      - private
+      - stg
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    steps:
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1.0.0'
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: '${{ secrets.ACTION_WIP_GCP }}'
+          service_account: '${{ secrets.ACTION_SA_GCP }}'
+      - name: Goose Fix Migration Process
+        uses: addnab/docker-run-action@v3
+        env:
+          BRANCHING: ${{ github.head_ref || github.ref_name }} 
+          TOKEN: ${{ secrets.CI_PUSH_TOKEN }}
+          USERNAME: ${{ secrets.DEPLOYER_USERNAME }}
+          URL: ${{ github.repository }}
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.access_token }}'
+          registry: ${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}
+          image: asia-southeast2-docker.pkg.dev/paireds-devops/central-tools/angsa:v1.1.0
+          options: -v ${{ github.workspace }}:/tmp/services
+          run: |
+            cd /tmp/services;
+            git clone https://${{ env.USERNAME }}:${{ env.TOKEN }}@github.com/${{ env.URL }};
+            cd viona-users;
+            git config --global user.email '${{ secrets.DEPLOYER_EMAIL }}';
+            git config --global user.name '${{ secrets.DEPLOYER_USERNAME }}';
+            echo ${{ env.BRANCHING }};
+            git checkout ${{ env.BRANCHING }};
+            goose -dir migration fix;
+            if [[ -n "$(git status --porcelain)" ]]; then
+                git add migration/;
+                git commit -m '[skip ci] goose fix from CI runner';
+                git push origin ${{ env.BRANCHING }};     
+            else
+                echo "THERE IS NO CHANGE";
+            fi 
+
+  migration_stg:
+    needs: migration_fix
+    runs-on:
+      - self-hosted
+      - private
+      - stg
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    steps:
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1.0.0'
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: '${{ secrets.ACTION_WIP_GCP }}'
+          service_account: '${{ secrets.ACTION_SA_GCP }}'
+      - name: Goose Migration Process
+        uses: addnab/docker-run-action@v3
+        env:
+          BRANCHING: ${{ github.head_ref || github.ref_name }} 
+          TOKEN: ${{ secrets.CI_PUSH_TOKEN }}
+          USERNAME: ${{ secrets.DEPLOYER_USERNAME }}
+          URL: ${{ github.repository }}
+          DB_HOST: ${{ secrets.STG_DB_HOST }}
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.access_token }}'
+          registry: ${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}
+          image: asia-southeast2-docker.pkg.dev/paireds-devops/central-tools/angsa:v1.1.0
+          options: -v ${{ github.workspace }}:/tmp/services
+          run: |
+            cd /tmp/services;
+            git clone https://${{ env.USERNAME }}:${{ env.TOKEN }}@github.com/${{ env.URL }}; 
+            cd viona-users;
+            git config --global user.email '${{ secrets.DEPLOYER_EMAIL }}';
+            git config --global user.name '${{ secrets.DEPLOYER_USERNAME }}';
+            git checkout ${{ env.BRANCHING }};
+            goose -dir migration postgres "user=svc_viona_users password=${{ env.DB_PASSWORD }} host=${{ env.DB_HOST }} dbname=${{ env.PRODUCT }}_${{ env.BINARY }} sslmode=disable" up;
+            goose -dir migration postgres "user=svc_viona_users password=${{ env.DB_PASSWORD }} host=${{ env.DB_HOST }} dbname=${{ env.PRODUCT }}_${{ env.BINARY }} sslmode=disable" status;
+
+  build_docker:
+    runs-on:
+      - self-hosted
+      - private
+      - stg
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    container:
+        image: docker:20.10.10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v1.0.0'
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: '${{ secrets.ACTION_WIP_GCP }}'
+          service_account: '${{ secrets.ACTION_SA_GCP }}'
+      - name: Login to GAR
+        uses: docker/login-action@v2
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.access_token }}'
+          registry: ${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}
+      - run: docker build --no-cache -t ${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}/${{ env.GCP_ARTIFACT_REGISTRY_PROJECT_ID }}/${{ env.PRODUCT }}/${{ env.BINARY }}:${{ github.sha }} --build-arg GITHUB_USERNAME=${{ secrets.DEPLOYER_USERNAME }} --build-arg GITHUB_TOKEN=${{ secrets.CI_GOLANG_DEP_PULL_TOKEN }} .;
+        shell: sh
+      - run: docker push ${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}/${{ env.GCP_ARTIFACT_REGISTRY_PROJECT_ID }}/${{ env.PRODUCT }}/${{ env.BINARY }}:${{ github.sha }};
+        shell: sh
+
+  argocd_deploy:
+    runs-on: 
+      - self-hosted
+      - private
+      - stg
+    needs: build_docker
+    steps: 
+       - name: ArgoCD Deploy
+         uses: addnab/docker-run-action@v3
+         env:
+          MANIFEST_REPO: https://github.com/paireds/viona-central-manifest.git
+          MANIFEST_FILE: manifests/${{ env.ENVIRONMENT }}/backend/${{ env.BINARY }}/deployment.yaml
+         with:
+          image: alpine/git
+          run:  |
+            apk update && apk add -qq yq;
+            echo "machine github.com login ${{ secrets.DEPLOYER_USERNAME }}@github.com password ${{ secrets.CI_PUSH_TOKEN }}" > ~/.netrc;
+            chmod 600 ~/.netrc;
+            mkdir .temp && cd .temp;
+            git config --global user.name "${{ secrets.DEPLOYER_USERNAME }}";
+            git config --global user.email "${{ secrets.DEPLOYER_USERNAME }}";
+            ${{ env.MANIFEST_FILE }};
+            git clone ${{ env.MANIFEST_REPO }};
+            cd viona-central-manifest;
+            echo "Deploying to ${{ env.ENVIRONMENT }} using Commit SHA";
+            yq ".spec.template.spec.containers.0.image |= \"${{ env.GCP_ARTIFACT_REGISTRY_ROOT }}/${{ env.GCP_ARTIFACT_REGISTRY_PROJECT_ID }}/${{ env.PRODUCT }}/${{ env.BINARY }}:${{ github.sha }}\"" ${{ env.MANIFEST_FILE }} > deployment.tmp && mv deployment.tmp ${{ env.MANIFEST_FILE }};
+            git add  ${{ env.MANIFEST_FILE }};
+            git commit -m "Deploy '${{ env.BINARY }}' app in '${{ env.ENVIRONMENT }}' from ref ${{ github.sha }}";
+            git push;
